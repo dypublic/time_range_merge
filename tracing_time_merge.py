@@ -7,8 +7,8 @@ from pyspark.sql.functions import from_json
 from pyspark.sql.types import StructType, StringType, TimestampType
 from pyspark.sql.functions import window
 from pyspark.sql.functions import mean, sum, col, when, struct, greatest, least
-from pyspark.sql.functions import min as psk_min
-from pyspark.sql.functions import max as psk_max
+from pyspark.sql.functions import min as spark_min
+from pyspark.sql.functions import max as spark_max
 
 import os
 
@@ -64,6 +64,24 @@ def generate_batch_tracing_log(batch):
 s = generate_batch_tracing_log(10)
 print(s)
 
+
+def merge_time(exist_list, pair):
+    if isinstance(exist_list, tuple):
+        return [exist_list]
+    new_list = []
+
+    for exist_pair in exist_list:
+        if pair[0] > exist_pair[1] or pair[1] < exist_pair[0]:
+            new_list.append(exist_pair)
+            print("skip:", pair, exist_pair)
+            continue
+        print("merging:", pair, exist_pair)
+        pair = (min(pair[0], exist_pair[0]), max(pair[1], exist_pair[1]))
+        print("merged:", pair)
+
+    new_list.append(pair)
+    return new_list
+
 # brokers = "172.27.0.236:9092, 172.27.0.75:9092"
 if __name__ == '__main__':
     spark = SparkSession \
@@ -83,19 +101,23 @@ if __name__ == '__main__':
     sc = spark.sparkContext
     logsRDD = sc.parallelize(json_logs)
     df = spark.read.json(logsRDD)
-    expr = [psk_min(col("start")).alias("start"), psk_max(col("end")).alias("end")]
+    expr = [spark_min(col("start")).alias("start"), spark_max(col("end")).alias("end")]
     df = df.select("root_id", "span_id", "start", "end").groupBy("root_id", "span_id").agg(*expr)
-
-    df = df.alias("t1").join(df.alias("t2")).where(col("t1.root_id") == col("t2.root_id"))
-
-    df = df.withColumn("merged",
-                       when(((col("t1.start") > col("t2.end")) | (col("t1.end") < col("t2.start"))),
-                            struct(col("t1.start").alias("t_start"), col("t1.end").alias("t_end"))) \
-                       .otherwise(
-                           struct(least(col("t1.start"), col("t2.start")).alias("t_start"), greatest(col("t1.end"), col("t2.end")).alias("t_end"))
-                       )
-                       # 1
-                       )
-    df = df.orderBy("t1.root_id", "t1.span_id")
-
-    df.show(truncate=False)
+    #
+    # df = df.alias("t1").join(df.alias("t2")).where(col("t1.root_id") == col("t2.root_id"))
+    # df = df.select(col("t1.root_id").alias("t1_root_id"), col("t1.start"), col("t1.end"), col("t2.start"), col("t2.end"))
+    #
+    # df = df.withColumn("expand",
+    #                    when(((col("t1.start") > col("t2.end")) | (col("t1.end") < col("t2.start"))),
+    #                         struct(col("t1.start").alias("t_start"), col("t1.end").alias("t_end"))) \
+    #                    .otherwise(
+    #                        struct(least(col("t1.start"), col("t2.start")).alias("t_start"), greatest(col("t1.end"), col("t2.end")).alias("t_end"))
+    #                    )
+    #                    # 1
+    #                    )
+    # df = df.dropDuplicates(["t1_root_id", "expand"])
+    rdd = df.rdd.map(lambda x: (x["root_id"], (x["start"], x["end"])))
+    rdd = rdd.reduceByKey(merge_time)
+    # df = df.orderBy("t1_root_id")
+    print(rdd.take(10))
+    # df.show(truncate=False)
